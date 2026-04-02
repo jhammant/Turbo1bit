@@ -27,6 +27,17 @@ All values measured via `/usr/bin/time -l` running `llama-bench` with flash atte
 
 **At 65K context, Q4_0 saves 5.0 GB of real RAM.**
 
+### Bonsai-8B KV Cache Memory at Various Context Lengths
+
+| Context | FP16 + FA | Q4_0 + FA | Saved |
+|---------|----------|----------|-------|
+| 2K | 1,592 MiB | 1,293 MiB | 299 MiB |
+| 8K | 2,379 MiB | 1,557 MiB | 822 MiB |
+| 32K | 5,891 MiB | 2,626 MiB | 3,265 MiB |
+| **65K** | **10,618 MiB** | **4,000 MiB** | **6,618 MiB** |
+
+**Bonsai-8B at 65K: 10.4 GB -> 3.9 GB. Fits on 8GB hardware.**
+
 ## Inference Speed (Measured)
 
 `llama-bench`, Bonsai-1.7B, flash attention on:
@@ -128,6 +139,17 @@ turbo1bit-infer -m Bonsai-1.7B.gguf -p "your prompt" -n 500 --no-turbo1bit
 | 16 GB | YES (barely) | YES (comfortably) |
 
 **Q4_0 KV cache makes Bonsai-8B at full 65K context fit on 8GB hardware.**
+
+## Server Mode
+
+`turbo1bit-server` wraps `llama-server` with auto-configured KV compression:
+
+```bash
+./turbo1bit-server Bonsai-8B.gguf --ctx 65536 --port 8080
+```
+
+OpenAI-compatible endpoints: `/v1/chat/completions`, `/v1/completions`, `/v1/models`.
+Auto-enables Flash Attention + Q4_0 KV cache. Tested and verified working.
 
 ## Reproducibility
 

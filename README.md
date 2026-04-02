@@ -81,22 +81,23 @@ Flash Attention also provides a **2.4x prefill speedup** as a bonus:
 | 32K | 5,891 MiB | 2,626 MiB | 3,265 MiB |
 | 65K | 10,618 MiB | 4,000 MiB | 6,618 MiB |
 
-### Output Quality
+### Output Quality — Perplexity (WikiText-2, Bonsai-1.7B, 20 chunks)
 
-All quantization levels produce coherent text. Tested with greedy sampling (temp=0) across multiple prompts:
+| Config | Perplexity | vs Baseline | Memory Saving |
+|--------|-----------|-------------|---------------|
+| FP16 + FA | **25.51** | — | 1x |
+| Q8_0 + FA | **25.49** | -0.1% | 1.75x |
+| Q5_0 + FA | **25.87** | +1.4% | 2.50x |
+| Q4_0 + FA | **26.82** | +5.1% | 2.91x |
 
-| Config | Quality |
-|--------|---------|
-| FP16 (baseline) | Reference |
-| Q8_0 + FA | Identical to baseline |
-| Q5_0 + FA | Minor rephrasings, fully coherent |
-| Q4_0 + FA | Slight variation, fully coherent |
+Q8_0 is statistically identical to baseline. Q4_0 adds 5% perplexity for 2.91x memory savings.
 
 ## What Turbo1Bit Includes
 
 | Component | Description |
 |-----------|-------------|
 | `turbo1bit` | Simple wrapper script with auto RAM detection |
+| `turbo1bit-server` | OpenAI-compatible API server with compressed KV cache |
 | `turbo1bit-infer` | Non-interactive inference tool with KV compression flags |
 | TurboQuant C port | Lloyd-Max codebooks, orthogonal rotation, QJL projection, group quantization |
 | Metal shaders | 5 GPU kernels for compressed KV attention (Apple Silicon) |
@@ -112,11 +113,27 @@ Beyond the native KV quantization, Turbo1Bit includes a C port of the [TurboQuan
 - **3-bit key compression**: Too aggressive — output degrades to gibberish
 - **Threshold**: 1-bit models need >= 4-bit keys (FP16 models can use 3-bit)
 
+## Server Mode
+
+Run an OpenAI-compatible API server with compressed KV cache:
+
+```bash
+./turbo1bit-server models/Bonsai-8B-gguf/Bonsai-8B.gguf --ctx 65536 --port 8080
+
+# Test with curl
+curl http://localhost:8080/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"messages":[{"role":"user","content":"Hello!"}]}'
+```
+
+Automatically enables Flash Attention and Q4_0 KV cache. Supports `/v1/chat/completions`, `/v1/completions`, and `/v1/models`.
+
 ## Project Structure
 
 ```text
 Turbo1bit/
 ├── turbo1bit                    # Simple wrapper script
+├── turbo1bit-server             # OpenAI-compatible API server
 ├── src/                         # TurboQuant C port
 │   ├── turbo1bit_codebook.h/c   # Lloyd-Max optimal codebooks
 │   ├── turbo1bit_rotation.h/c   # QR rotation + QJL projection
