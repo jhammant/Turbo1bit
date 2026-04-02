@@ -45,13 +45,15 @@ python3 -c "from huggingface_hub import snapshot_download; snapshot_download('pr
 
 ## How It Works
 
-Turbo1Bit discovered that Bonsai's custom 1-bit inference kernels support quantized KV cache storage — but **only when Flash Attention is enabled**. Without FA, any KV quantization attempt fails with:
+llama.cpp has built-in KV cache quantization (`--ctk`, `--ctv`) and Flash Attention (`--fa`), but Bonsai's documentation and scripts don't use either. Trying KV quantization without FA produces a cryptic error, so most users assume it's unsupported. Turbo1Bit validated that the combination works with 1-bit models and measured the quality/memory trade-offs:
 
 ```text
 llama_init_from_model: quantized V cache was requested, but this requires Flash Attention
 ```
 
-With `--fa on`, llama.cpp's Q4_0/Q5_0/Q8_0 KV cache types work perfectly. This was not documented anywhere in the Bonsai project.
+**Why does quantized V cache require Flash Attention?** Without FA, llama.cpp stores the V cache **transposed** — each row is a single element scattered across heads, which is incompatible with block quantization formats like Q4_0 (they need contiguous groups of 32 values). Flash Attention stores V non-transposed (contiguous per head), making quantization possible.
+
+With `--fa on`, Q4_0/Q5_0/Q8_0 KV cache types work. This combination is undocumented in the Bonsai project and we validated quality for 1-bit models specifically.
 
 Flash Attention also provides a **2.4x prefill speedup** as a bonus:
 

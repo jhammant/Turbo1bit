@@ -20,9 +20,11 @@ How we got here:
 
 Bonsai's 1-bit models are already incredibly small — the 8B model is just 1.1 GB on disk. But at long contexts, the KV cache dominates memory. At 65K tokens, the KV cache alone is ~9 GB in FP16.
 
-We set out to port TurboQuant's ICLR 2026 compression algorithms (Lloyd-Max quantization, QJL sign projection) from Python to C. Along the way, we discovered something simpler: Bonsai's custom inference kernels already support llama.cpp's built-in KV cache quantization — but only when Flash Attention is enabled.
+We set out to port TurboQuant's ICLR 2026 compression algorithms (Lloyd-Max quantization, QJL sign projection) from Python to C. Along the way, we found that llama.cpp already has KV cache quantization (--ctk, --ctv flags) — but Bonsai's docs and scripts don't use it. Trying it without Flash Attention gives a cryptic error, so most users would assume it's unsupported.
 
-Without FA, any attempt to use quantized KV cache with Bonsai fails with "quantized V cache was requested, but this requires Flash Attention." This wasn't documented anywhere. Once we added --fa on, Q4_0 KV cache just worked.
+The technical reason: without Flash Attention, llama.cpp stores the V cache transposed (one element per row), which breaks block quantization formats like Q4_0 that need groups of 32 contiguous values. Flash Attention stores V non-transposed, making quantization work.
+
+Once we added --fa on, Q4_0 KV cache just worked. We then validated quality specifically for 1-bit models — something nobody had tested.
 
 Flash Attention also turned out to be a 2.4x prefill speedup: 1,425 tok/s without FA vs 3,452 tok/s with FA. So the compressed version is actually faster than the original.
 
