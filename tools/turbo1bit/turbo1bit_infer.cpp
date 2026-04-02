@@ -29,8 +29,8 @@ struct turbo1bit_state {
     int n_layers = 0;
     int n_kv_heads = 0;
     int head_dim = 0;
-    int key_bits = 3;
-    int value_bits = 4;  // 4-bit values for higher quality (0.998 cos_sim vs 0.961 at 2-bit)
+    int key_bits = 0;     // 0 = no key compression (default safe mode)
+    int value_bits = 4;   // 4-bit values (0.998 cos_sim)
     int value_group_size = 32;
     int64_t tokens_compressed = 0;
 
@@ -56,16 +56,21 @@ static void turbo1bit_init(turbo1bit_state & state, const llama_model * model) {
     fprintf(stderr, "[Turbo1Bit] %d layers, %d KV heads, head_dim=%d\n",
             state.n_layers, state.n_kv_heads, state.head_dim);
 
-    state.quantizers.resize(state.n_layers);
-    for (int l = 0; l < state.n_layers; l++) {
-        state.quantizers[l] = t1b_quantizer_create(state.head_dim, state.key_bits, l);
-        if (!state.quantizers[l]) {
-            fprintf(stderr, "[Turbo1Bit] ERROR: Failed to create quantizer for layer %d\n", l);
-            state.enabled = false;
-            return;
+    if (state.key_bits >= 2) {
+        state.quantizers.resize(state.n_layers);
+        for (int l = 0; l < state.n_layers; l++) {
+            state.quantizers[l] = t1b_quantizer_create(state.head_dim, state.key_bits, l);
+            if (!state.quantizers[l]) {
+                fprintf(stderr, "[Turbo1Bit] ERROR: Failed to create quantizer for layer %d\n", l);
+                state.enabled = false;
+                return;
+            }
         }
+        fprintf(stderr, "[Turbo1Bit] Key compression: %d-bit TurboQuantProd\n", state.key_bits);
+    } else {
+        fprintf(stderr, "[Turbo1Bit] Key compression: DISABLED (FP16 passthrough)\n");
     }
-    fprintf(stderr, "[Turbo1Bit] Ready (%.2fx compression)\n", 512.0f / 120.0f);
+    fprintf(stderr, "[Turbo1Bit] Value compression: %d-bit group quantization\n", state.value_bits);
 
     // Will be initialized when we know the KV cache size
     state.slot_compressed.clear();
@@ -129,13 +134,20 @@ static void turbo1bit_apply(turbo1bit_state & state, llama_context * ctx, int cu
             continue;
         }
 
-        // Skip key compression for now — 3-bit is too aggressive for 1-bit models.
-        // Only apply value compression (which has higher fidelity).
-        // TODO: Investigate higher-bit key compression (4-bit or 5-bit).
-        (void)state; // suppress unused warning for quantizers
-
-        // Key compression disabled — pass through at full precision
-        // The memory savings come entirely from value compression in this mode.
+        // Key compression (only if key_bits >= 2)
+        if (state.key_bits >= 2 && l < (int)state.quantizers.size() && state.quantizers[l]) {
+            t1b_quantizer *q = state.quantizers[l];
+            for (int h = 0; h < state.n_kv_heads; h++) {
+                float *hd = k_f32.data() + h * state.head_dim;
+                uint8_t mse_buf[256], sign_buf[256];
+                t1b_prod_quantized pq;
+                memset(&pq, 0, sizeof(pq));
+                pq.mse_indices = mse_buf;
+                pq.qjl_signs = sign_buf;
+                t1b_quantize_prod(q, hd, &pq);
+                t1b_dequantize_prod(q, &pq, hd);
+            }
+        }
 
         // Write back
         if (k_tensor->type == GGML_TYPE_F16) {
@@ -201,15 +213,27 @@ int main(int argc, char **argv) {
     bool use_turbo1bit = true;
     int ctx_size = 2048;
 
+    int key_bits = 0;   // 0=disabled, 3-5 = TurboQuantProd
+    int val_bits = 4;   // 2 or 4
+
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "-m" && i + 1 < argc) model_path = argv[++i];
         else if (arg == "-p" && i + 1 < argc) prompt = argv[++i];
         else if (arg == "-n" && i + 1 < argc) n_predict = atoi(argv[++i]);
         else if (arg == "-c" && i + 1 < argc) ctx_size = atoi(argv[++i]);
+        else if (arg == "--key-bits" && i + 1 < argc) key_bits = atoi(argv[++i]);
+        else if (arg == "--val-bits" && i + 1 < argc) val_bits = atoi(argv[++i]);
         else if (arg == "--no-turbo1bit") use_turbo1bit = false;
         else if (arg == "-h" || arg == "--help") {
-            fprintf(stderr, "Usage: %s -m model.gguf [-p prompt] [-n tokens] [-c ctx] [--no-turbo1bit]\n", argv[0]);
+            fprintf(stderr, "Usage: %s -m model.gguf [-p prompt] [-n tokens] [-c ctx]\n", argv[0]);
+            fprintf(stderr, "       [--key-bits N] [--val-bits N] [--no-turbo1bit]\n");
+            fprintf(stderr, "  --key-bits 0    No key compression (default, safest)\n");
+            fprintf(stderr, "  --key-bits 3    3-bit keys (aggressive, may degrade 1-bit models)\n");
+            fprintf(stderr, "  --key-bits 4    4-bit keys (moderate)\n");
+            fprintf(stderr, "  --key-bits 5    5-bit keys (conservative)\n");
+            fprintf(stderr, "  --val-bits 2    2-bit values (aggressive, 4x value compression)\n");
+            fprintf(stderr, "  --val-bits 4    4-bit values (default, 2.7x, near-lossless)\n");
             return 0;
         }
     }
@@ -240,7 +264,11 @@ int main(int argc, char **argv) {
 
     // Init Turbo1Bit
     turbo1bit_state t1b;
-    if (use_turbo1bit) turbo1bit_init(t1b, model);
+    if (use_turbo1bit) {
+        t1b.key_bits = key_bits;
+        t1b.value_bits = val_bits;
+        turbo1bit_init(t1b, model);
+    }
 
     // Tokenize
     const llama_vocab * vocab = llama_model_get_vocab(model);
