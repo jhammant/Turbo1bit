@@ -18,6 +18,7 @@ struct t1b_metal_ctx {
     id<MTLComputePipelineState> ps_qjl_score;
     id<MTLComputePipelineState> ps_fused_attn;
     id<MTLComputePipelineState> ps_dequant_values;
+    id<MTLComputePipelineState> ps_value_qd_inplace;
     id<MTLComputePipelineState> ps_matvec;
 };
 
@@ -99,6 +100,7 @@ t1b_metal_ctx * t1b_metal_init(void) {
     ctx->ps_qjl_score     = make_pipeline(device, ctx->library, @"t1b_qjl_score");
     ctx->ps_fused_attn    = make_pipeline(device, ctx->library, @"t1b_fused_attn");
     ctx->ps_dequant_values= make_pipeline(device, ctx->library, @"t1b_dequant_values");
+    ctx->ps_value_qd_inplace = make_pipeline(device, ctx->library, @"t1b_value_quant_dequant_inplace");
     ctx->ps_matvec        = make_pipeline(device, ctx->library, @"t1b_matvec");
 
     return ctx;
@@ -200,6 +202,44 @@ void t1b_metal_qjl_score(
     [cmd waitUntilCompleted];
 
     memcpy(scores_inout, buf_scores.contents, n_tokens * sizeof(float));
+}
+
+void t1b_metal_value_quant_dequant(
+    t1b_metal_ctx *ctx,
+    void *data_fp16,
+    uint32_t n_elements,
+    uint32_t group_size,
+    uint32_t bits)
+{
+    if (!ctx || !ctx->ps_value_qd_inplace) return;
+
+    uint32_t n_groups = n_elements / group_size;
+    size_t data_size = n_elements * sizeof(uint16_t); // FP16 = 2 bytes
+
+    // Shared buffer — Metal can read/write in-place
+    id<MTLBuffer> buf_data = [ctx->device newBufferWithBytes:data_fp16
+                                                      length:data_size
+                                                     options:MTLResourceStorageModeShared];
+
+    id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    [enc setComputePipelineState:ctx->ps_value_qd_inplace];
+    [enc setBuffer:buf_data  offset:0 atIndex:0];
+    [enc setBytes:&n_elements  length:sizeof(uint32_t) atIndex:1];
+    [enc setBytes:&group_size  length:sizeof(uint32_t) atIndex:2];
+    [enc setBytes:&bits        length:sizeof(uint32_t) atIndex:3];
+
+    NSUInteger tpg = ctx->ps_value_qd_inplace.maxTotalThreadsPerThreadgroup;
+    if (tpg > 256) tpg = 256;
+    MTLSize grid = MTLSizeMake(n_groups, 1, 1);
+    MTLSize group = MTLSizeMake(tpg < n_groups ? tpg : n_groups, 1, 1);
+    [enc dispatchThreads:grid threadsPerThreadgroup:group];
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+
+    // Copy result back
+    memcpy(data_fp16, buf_data.contents, data_size);
 }
 
 void t1b_metal_matvec(

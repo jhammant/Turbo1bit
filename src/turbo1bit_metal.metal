@@ -326,7 +326,47 @@ kernel void t1b_dequant_values(
     }
 }
 
-// ── Kernel 5: Matrix-Vector Multiply (for rotation) ─────────────────
+// ── Kernel 5: In-place Value Quantize-Dequantize ────────────────────
+//
+// Performs group quantization then dequantization in-place on FP16 data.
+// This simulates compression: values are replaced with their lossy reconstructed versions.
+// Each thread handles one group of `group_size` elements.
+
+kernel void t1b_value_quant_dequant_inplace(
+    device half         *data        [[buffer(0)]],  // [n_elements] FP16 in/out
+    constant uint       &n_elements  [[buffer(1)]],
+    constant uint       &group_size  [[buffer(2)]],
+    constant uint       &bits        [[buffer(3)]],
+    uint tid [[thread_position_in_grid]])
+{
+    uint n_groups = n_elements / group_size;
+    if (tid >= n_groups) return;
+
+    uint base = tid * group_size;
+    uint n_levels = (1u << bits) - 1u;
+
+    // Find min/max of group
+    float vmin = float(data[base]);
+    float vmax = vmin;
+    for (uint i = 1; i < group_size; i++) {
+        float v = float(data[base + i]);
+        vmin = min(vmin, v);
+        vmax = max(vmax, v);
+    }
+
+    float scale = (vmax - vmin) / float(n_levels);
+    if (scale < 1e-10f) scale = 1e-10f;
+
+    // Quantize then immediately dequantize
+    for (uint i = 0; i < group_size; i++) {
+        float v = float(data[base + i]);
+        float normalized = (v - vmin) / scale;
+        uint q = uint(clamp(normalized + 0.5f, 0.0f, float(n_levels)));
+        data[base + i] = half(float(q) * scale + vmin);
+    }
+}
+
+// ── Kernel 6: Matrix-Vector Multiply (for rotation) ─────────────────
 //
 // Computes y = x @ M^T where M is a d x d matrix (rotation or QJL).
 // Used for: query rotation (x @ Pi^T) and query sketching (x @ S^T).

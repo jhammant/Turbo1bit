@@ -80,6 +80,16 @@ void t1b_metal_fused_attn(
     uint32_t head_dim,
     float attn_scale);
 
+// In-place value quantize-dequantize on FP16 data (group quantization round-trip).
+// Simulates compression: each group is quantized to `bits` then immediately dequantized.
+// data is FP16 (half), n_elements total, group_size per group.
+void t1b_metal_value_quant_dequant(
+    t1b_metal_ctx *ctx,
+    void *data_fp16,        // FP16 data, modified in-place
+    uint32_t n_elements,
+    uint32_t group_size,
+    uint32_t bits);
+
 // GPU matrix-vector multiply: y = x @ M^T
 void t1b_metal_matvec(
     t1b_metal_ctx *ctx,

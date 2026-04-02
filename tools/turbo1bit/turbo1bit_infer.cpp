@@ -14,6 +14,7 @@
 
 extern "C" {
 #include "turbo1bit_quantizer.h"
+#include "turbo1bit_metal.h"
 }
 
 #include "llama-kv-cache.h"
@@ -35,12 +36,14 @@ struct turbo1bit_state {
     int64_t tokens_compressed = 0;
 
     std::vector<t1b_quantizer *> quantizers;
+    t1b_metal_ctx *metal = nullptr;  // GPU acceleration
 
     // Track which KV slots have already been compressed (avoid double-compression)
     std::vector<bool> slot_compressed;
 
     ~turbo1bit_state() {
         for (auto *q : quantizers) t1b_quantizer_free(q);
+        t1b_metal_free(metal);
     }
 };
 
@@ -71,6 +74,14 @@ static void turbo1bit_init(turbo1bit_state & state, const llama_model * model) {
         fprintf(stderr, "[Turbo1Bit] Key compression: DISABLED (FP16 passthrough)\n");
     }
     fprintf(stderr, "[Turbo1Bit] Value compression: %d-bit group quantization\n", state.value_bits);
+
+    // Initialize Metal GPU acceleration
+    state.metal = t1b_metal_init();
+    if (state.metal) {
+        fprintf(stderr, "[Turbo1Bit] Metal GPU acceleration: ENABLED\n");
+    } else {
+        fprintf(stderr, "[Turbo1Bit] Metal GPU acceleration: not available (using CPU)\n");
+    }
 
     // Will be initialized when we know the KV cache size
     state.slot_compressed.clear();
@@ -163,43 +174,59 @@ static void turbo1bit_apply(turbo1bit_state & state, llama_context * ctx, int cu
         // Same for V (group quantization) — only if not transposed
         if (!kv->get_v_trans()) {
             size_t v_row_size = ggml_row_size(v_tensor->type, n_embd_k);
-            std::vector<uint8_t> v_raw(v_row_size);
-            ggml_backend_tensor_get(v_tensor, v_raw.data(),
-                                    (size_t)compress_slot * v_row_size, v_row_size);
 
-            std::vector<float> v_f32(n_embd_k);
-            if (v_tensor->type == GGML_TYPE_F16) {
-                auto *src = reinterpret_cast<const ggml_fp16_t *>(v_raw.data());
-                for (int i = 0; i < n_embd_k; i++) v_f32[i] = ggml_fp16_to_fp32(src[i]);
-            } else if (v_tensor->type == GGML_TYPE_F32) {
-                memcpy(v_f32.data(), v_raw.data(), n_embd_k * sizeof(float));
-            } else {
-                continue;
-            }
+            if (state.metal && v_tensor->type == GGML_TYPE_F16) {
+                // Metal GPU path: read FP16 data, quantize-dequantize on GPU, write back
+                std::vector<uint8_t> v_raw(v_row_size);
+                ggml_backend_tensor_get(v_tensor, v_raw.data(),
+                                        (size_t)compress_slot * v_row_size, v_row_size);
 
-            for (int h = 0; h < state.n_kv_heads; h++) {
-                float *hd = v_f32.data() + h * state.head_dim;
-                int gs = state.value_group_size;
-                int ng = state.head_dim / gs;
-                uint8_t data_buf[256];
-                float sc[16], zr[16];
-                t1b_value_quantized vq;
-                memset(&vq, 0, sizeof(vq));
-                vq.data = data_buf; vq.scales = sc; vq.zeros = zr;
-                vq.bits = state.value_bits; vq.d = state.head_dim;
-                vq.group_size = gs; vq.n_groups = ng;
-                t1b_quantize_values(hd, state.head_dim, state.value_bits, gs, &vq);
-                t1b_dequantize_values(&vq, hd);
-            }
+                t1b_metal_value_quant_dequant(state.metal, v_raw.data(),
+                                              n_embd_k, state.value_group_size,
+                                              state.value_bits);
 
-            if (v_tensor->type == GGML_TYPE_F16) {
-                std::vector<ggml_fp16_t> v_f16(n_embd_k);
-                for (int i = 0; i < n_embd_k; i++) v_f16[i] = ggml_fp32_to_fp16(v_f32[i]);
-                ggml_backend_tensor_set(v_tensor, v_f16.data(),
+                ggml_backend_tensor_set(v_tensor, v_raw.data(),
                                         (size_t)compress_slot * v_row_size, v_row_size);
             } else {
-                ggml_backend_tensor_set(v_tensor, v_f32.data(),
+                // CPU fallback
+                std::vector<uint8_t> v_raw(v_row_size);
+                ggml_backend_tensor_get(v_tensor, v_raw.data(),
                                         (size_t)compress_slot * v_row_size, v_row_size);
+
+                std::vector<float> v_f32(n_embd_k);
+                if (v_tensor->type == GGML_TYPE_F16) {
+                    auto *src = reinterpret_cast<const ggml_fp16_t *>(v_raw.data());
+                    for (int i = 0; i < n_embd_k; i++) v_f32[i] = ggml_fp16_to_fp32(src[i]);
+                } else if (v_tensor->type == GGML_TYPE_F32) {
+                    memcpy(v_f32.data(), v_raw.data(), n_embd_k * sizeof(float));
+                } else {
+                    continue;
+                }
+
+                for (int h = 0; h < state.n_kv_heads; h++) {
+                    float *hd = v_f32.data() + h * state.head_dim;
+                    int gs = state.value_group_size;
+                    int ng = state.head_dim / gs;
+                    uint8_t data_buf[256];
+                    float sc[16], zr[16];
+                    t1b_value_quantized vq;
+                    memset(&vq, 0, sizeof(vq));
+                    vq.data = data_buf; vq.scales = sc; vq.zeros = zr;
+                    vq.bits = state.value_bits; vq.d = state.head_dim;
+                    vq.group_size = gs; vq.n_groups = ng;
+                    t1b_quantize_values(hd, state.head_dim, state.value_bits, gs, &vq);
+                    t1b_dequantize_values(&vq, hd);
+                }
+
+                if (v_tensor->type == GGML_TYPE_F16) {
+                    std::vector<ggml_fp16_t> v_f16(n_embd_k);
+                    for (int i = 0; i < n_embd_k; i++) v_f16[i] = ggml_fp32_to_fp16(v_f32[i]);
+                    ggml_backend_tensor_set(v_tensor, v_f16.data(),
+                                            (size_t)compress_slot * v_row_size, v_row_size);
+                } else {
+                    ggml_backend_tensor_set(v_tensor, v_f32.data(),
+                                            (size_t)compress_slot * v_row_size, v_row_size);
+                }
             }
         }
     }
