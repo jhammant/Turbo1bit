@@ -1,0 +1,38 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.dylib
+*.metallib
+*.air
+
+# Models (too large for git)
+models/
+*.gguf
+*.bin
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Submodules managed separately
+bonsai-llama.cpp/
+turboquant/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Planning/scratch
+.planning/
+scratchpad*
+build-standalone/
