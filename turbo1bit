@@ -1,0 +1,171 @@
+#!/bin/bash
+# turbo1bit — Simple wrapper for running Bonsai models with optimized KV cache
+#
+# Usage:
+#   turbo1bit run <model.gguf> "Your prompt here" [options]
+#   turbo1bit bench <model.gguf>
+#   turbo1bit info
+#
+# Automatically detects available RAM and picks the best KV cache configuration.
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUILD_DIR="$SCRIPT_DIR/bonsai-llama.cpp/build"
+INFER_BIN="$BUILD_DIR/bin/turbo1bit-infer"
+BENCH_BIN="$BUILD_DIR/bin/llama-bench"
+
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# Detect available RAM (macOS)
+get_available_ram_gb() {
+    if [[ "$(uname)" == "Darwin" ]]; then
+        local total_bytes=$(sysctl -n hw.memsize)
+        echo $((total_bytes / 1024 / 1024 / 1024))
+    else
+        local total_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+        echo $((total_kb / 1024 / 1024))
+    fi
+}
+
+# Pick best KV cache config based on available RAM and model size
+pick_config() {
+    local model="$1"
+    local ctx="${2:-2048}"
+    local ram_gb=$(get_available_ram_gb)
+    local model_size_mb=$(du -m "$model" | cut -f1)
+
+    # Estimate KV cache size at requested context
+    # Rough: n_layers * n_kv_heads * head_dim * 2 (K+V) * 2 (fp16) * ctx
+    # For 8B: ~32 * 8 * 128 * 4 * ctx = 131072 * ctx bytes
+    # For 1.7B: ~24 * 8 * 128 * 4 * ctx = 98304 * ctx bytes
+
+    local kv_fp16_mb=$((ctx * 131072 / 1024 / 1024))  # rough upper bound
+    local available_mb=$(( (ram_gb - 2) * 1024 - model_size_mb ))  # leave 2GB for OS
+
+    if (( kv_fp16_mb < available_mb )); then
+        echo "f16"  # FP16 fits, no compression needed
+    elif (( kv_fp16_mb / 2 < available_mb )); then
+        echo "q8_0"  # Q8 fits
+    elif (( kv_fp16_mb / 3 < available_mb )); then
+        echo "q5_0"  # Q5 fits
+    else
+        echo "q4_0"  # Maximum compression
+    fi
+}
+
+cmd_run() {
+    local model="$1"
+    shift
+    local prompt="$1"
+    shift
+
+    if [[ -z "$model" || -z "$prompt" ]]; then
+        echo "Usage: turbo1bit run <model.gguf> \"prompt\" [-n tokens] [-c context]"
+        exit 1
+    fi
+
+    # Check binary exists
+    if [[ ! -f "$INFER_BIN" ]]; then
+        echo -e "${YELLOW}Building turbo1bit-infer...${NC}"
+        cd "$SCRIPT_DIR/bonsai-llama.cpp"
+        mkdir -p build && cd build
+        cmake .. -G Ninja -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release 2>/dev/null
+        ninja turbo1bit-infer 2>&1 | tail -3
+        cd "$SCRIPT_DIR"
+    fi
+
+    # Parse remaining args
+    local n_predict=256
+    local ctx_size=2048
+    local extra_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n) n_predict="$2"; shift 2 ;;
+            -c) ctx_size="$2"; shift 2 ;;
+            --baseline) extra_args+=(--no-turbo1bit); shift ;;
+            *) extra_args+=("$1"); shift ;;
+        esac
+    done
+
+    # Auto-detect best config
+    local config=$(pick_config "$model" "$ctx_size")
+    local ram_gb=$(get_available_ram_gb)
+
+    echo -e "${CYAN}Turbo1Bit${NC}"
+    echo -e "  RAM: ${ram_gb} GB detected"
+    echo -e "  KV cache: ${GREEN}${config}${NC} (auto-selected for context=$ctx_size)"
+    if [[ "$config" != "f16" ]]; then
+        echo -e "  Flash Attention: ${GREEN}enabled${NC} (required for KV compression)"
+    fi
+    echo ""
+
+    if [[ "$config" == "f16" ]]; then
+        "$INFER_BIN" -m "$model" -p "$prompt" -n $n_predict -c $ctx_size "${extra_args[@]}"
+    else
+        "$INFER_BIN" -m "$model" -p "$prompt" -n $n_predict -c $ctx_size \
+            --ctk "$config" --ctv "$config" --fa "${extra_args[@]}"
+    fi
+}
+
+cmd_bench() {
+    local model="$1"
+    if [[ -z "$model" ]]; then
+        echo "Usage: turbo1bit bench <model.gguf>"
+        exit 1
+    fi
+
+    if [[ ! -f "$BENCH_BIN" ]]; then
+        echo "Build llama-bench first: cd bonsai-llama.cpp/build && ninja llama-bench"
+        exit 1
+    fi
+
+    echo -e "${CYAN}=== Turbo1Bit Benchmark ===${NC}"
+    echo ""
+
+    echo -e "${YELLOW}Speed (prefill + decode):${NC}"
+    "$BENCH_BIN" -m "$model" -p 512,2048,8192 -n 128 -r 2 -fa 1 2>&1 | grep -E "^\|"
+    echo ""
+
+    echo -e "${YELLOW}Speed with Q4_0 KV compression:${NC}"
+    "$BENCH_BIN" -m "$model" -p 512,2048,8192 -n 128 -r 2 -ctk q4_0 -ctv q4_0 -fa 1 2>&1 | grep -E "^\|"
+    echo ""
+
+    echo -e "${YELLOW}Memory at 32K context:${NC}"
+    printf "  FP16: "
+    /usr/bin/time -l "$BENCH_BIN" -m "$model" -p 32768 -n 1 -r 1 -fa 1 2>&1 | grep "maximum resident" | awk '{printf "%d MiB\n", $1/1024/1024}'
+    printf "  Q4_0: "
+    /usr/bin/time -l "$BENCH_BIN" -m "$model" -p 32768 -n 1 -r 1 -ctk q4_0 -ctv q4_0 -fa 1 2>&1 | grep "maximum resident" | awk '{printf "%d MiB\n", $1/1024/1024}'
+}
+
+cmd_info() {
+    echo -e "${CYAN}Turbo1Bit${NC} — Efficient inference for Bonsai 1-bit LLMs"
+    echo ""
+    echo "Enables KV cache compression for PrismML's Bonsai models by"
+    echo "combining Flash Attention with quantized KV cache storage."
+    echo ""
+    echo "Memory savings (measured, Bonsai-1.7B at 65K context):"
+    echo "  FP16:  7,846 MiB"
+    echo "  Q8_0:  4,489 MiB  (saves 3.4 GB)"
+    echo "  Q5_0:  3,142 MiB  (saves 4.7 GB)"
+    echo "  Q4_0:  2,694 MiB  (saves 5.0 GB)"
+    echo ""
+    echo "Commands:"
+    echo "  turbo1bit run <model> \"prompt\"   Run inference with auto-optimized config"
+    echo "  turbo1bit bench <model>           Run memory and speed benchmarks"
+    echo "  turbo1bit info                    Show this help"
+    echo ""
+    echo "GitHub: https://github.com/jhammant/Turbo1bit"
+}
+
+case "${1:-info}" in
+    run)   shift; cmd_run "$@" ;;
+    bench) shift; cmd_bench "$@" ;;
+    info)  cmd_info ;;
+    -h|--help) cmd_info ;;
+    *)     echo "Unknown command: $1. Try: turbo1bit info"; exit 1 ;;
+esac
