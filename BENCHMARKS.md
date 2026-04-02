@@ -57,6 +57,17 @@ Output compared manually for coherence, factual accuracy, and completion quality
 
 All native quantization configs produce **coherent, readable text** with no gibberish.
 
+### Perplexity (WikiText-2, Bonsai-1.7B, 20 chunks, ctx=512)
+
+| Config | Perplexity | vs Baseline | Quality Impact |
+|--------|-----------|-------------|----------------|
+| FP16 + FA (baseline) | **25.51** | — | Reference |
+| Q8_0 + FA | **25.49** | -0.1% | Negligible |
+| Q5_0 + FA | **25.87** | +1.4% | Minor |
+| Q4_0 + FA | **26.82** | +5.1% | Moderate |
+
+**Q8_0 is statistically identical to baseline.** Q4_0 adds 5% perplexity for a 2.91x memory saving — a strong trade-off.
+
 ### Using Turbo1Bit in-place compression (our custom code)
 
 | Config | Quality | Notes |
