@@ -215,6 +215,9 @@ int main(int argc, char **argv) {
 
     int key_bits = 0;   // 0=disabled, 3-5 = TurboQuantProd
     int val_bits = 4;   // 2 or 4
+    std::string ctk_str = "f16";  // llama.cpp native KV cache type for keys
+    std::string ctv_str = "f16";  // llama.cpp native KV cache type for values
+    bool use_fa = false;          // flash attention (required for native KV quant)
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -224,18 +227,28 @@ int main(int argc, char **argv) {
         else if (arg == "-c" && i + 1 < argc) ctx_size = atoi(argv[++i]);
         else if (arg == "--key-bits" && i + 1 < argc) key_bits = atoi(argv[++i]);
         else if (arg == "--val-bits" && i + 1 < argc) val_bits = atoi(argv[++i]);
+        else if ((arg == "--ctk" || arg == "-ctk") && i + 1 < argc) ctk_str = argv[++i];
+        else if ((arg == "--ctv" || arg == "-ctv") && i + 1 < argc) ctv_str = argv[++i];
+        else if (arg == "--fa") use_fa = true;
         else if (arg == "--no-turbo1bit") use_turbo1bit = false;
         else if (arg == "-h" || arg == "--help") {
             fprintf(stderr, "Usage: %s -m model.gguf [-p prompt] [-n tokens] [-c ctx]\n", argv[0]);
-            fprintf(stderr, "       [--key-bits N] [--val-bits N] [--no-turbo1bit]\n");
-            fprintf(stderr, "  --key-bits 0    No key compression (default, safest)\n");
-            fprintf(stderr, "  --key-bits 3    3-bit keys (aggressive, may degrade 1-bit models)\n");
-            fprintf(stderr, "  --key-bits 4    4-bit keys (moderate)\n");
-            fprintf(stderr, "  --key-bits 5    5-bit keys (conservative)\n");
-            fprintf(stderr, "  --val-bits 2    2-bit values (aggressive, 4x value compression)\n");
-            fprintf(stderr, "  --val-bits 4    4-bit values (default, 2.7x, near-lossless)\n");
+            fprintf(stderr, "       [--ctk TYPE] [--ctv TYPE] [--fa] [--no-turbo1bit]\n");
+            fprintf(stderr, "       [--key-bits N] [--val-bits N]\n");
+            fprintf(stderr, "\nNative KV cache quantization (SAVES REAL MEMORY, requires --fa):\n");
+            fprintf(stderr, "  --ctk q4_0 --ctv q4_0 --fa   4-bit KV cache (2.65x memory reduction)\n");
+            fprintf(stderr, "  --ctk q5_0 --ctv q5_0 --fa   5-bit KV cache (2.32x memory reduction)\n");
+            fprintf(stderr, "  --ctk q8_0 --ctv q8_0 --fa   8-bit KV cache (1.68x memory reduction)\n");
+            fprintf(stderr, "\nTurbo1Bit in-place compression (quality simulation, no memory saving yet):\n");
+            fprintf(stderr, "  --key-bits 5 --val-bits 2     5-bit keys + 2-bit values\n");
+            fprintf(stderr, "  --no-turbo1bit                Baseline (no compression)\n");
             return 0;
         }
+    }
+
+    // Auto-enable FA if KV quantization requested
+    if (ctk_str != "f16" || ctv_str != "f16") {
+        use_fa = true;
     }
 
     if (model_path.empty()) {
@@ -245,7 +258,12 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "=== Turbo1Bit Inference ===\n");
     fprintf(stderr, "Model: %s\n", model_path.c_str());
-    fprintf(stderr, "Mode:  %s\n", use_turbo1bit ? "TURBO1BIT (compressed KV)" : "BASELINE (FP16 KV)");
+    if (ctk_str != "f16" || ctv_str != "f16") {
+        fprintf(stderr, "Mode:  NATIVE KV QUANT (K=%s V=%s, FA=%s)\n",
+                ctk_str.c_str(), ctv_str.c_str(), use_fa ? "on" : "off");
+    } else {
+        fprintf(stderr, "Mode:  %s\n", use_turbo1bit ? "TURBO1BIT (compressed KV)" : "BASELINE (FP16 KV)");
+    }
     fprintf(stderr, "Ctx:   %d, Predict: %d\n\n", ctx_size, n_predict);
 
     // Load model
@@ -254,10 +272,24 @@ int main(int argc, char **argv) {
     if (!model) { fprintf(stderr, "Failed to load model\n"); return 1; }
 
     // Create context
+    // Map type strings to ggml types
+    auto str_to_type = [](const std::string & s) -> ggml_type {
+        if (s == "f32")  return GGML_TYPE_F32;
+        if (s == "f16")  return GGML_TYPE_F16;
+        if (s == "q8_0") return GGML_TYPE_Q8_0;
+        if (s == "q5_0") return GGML_TYPE_Q5_0;
+        if (s == "q5_1") return GGML_TYPE_Q5_1;
+        if (s == "q4_0") return GGML_TYPE_Q4_0;
+        if (s == "q4_1") return GGML_TYPE_Q4_1;
+        return GGML_TYPE_F16;
+    };
+
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = ctx_size;
     cparams.n_batch = 512;
-    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cparams.type_k = str_to_type(ctk_str);
+    cparams.type_v = str_to_type(ctv_str);
+    cparams.flash_attn_type = use_fa ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
 
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) { fprintf(stderr, "Failed to create context\n"); llama_model_free(model); return 1; }
